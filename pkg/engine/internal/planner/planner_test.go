@@ -84,7 +84,9 @@ func (q *TestQuery) Step() time.Duration {
 
 var _ logql.Params = (*TestQuery)(nil)
 
-type TestMetastore struct{}
+type TestMetastore struct {
+	MetadataColumns []string
+}
 
 // Labels implements metastore.Metastore.
 func (t *TestMetastore) Labels(_ context.Context, _ time.Time, _ time.Time, _ ...*labels.Matcher) ([]string, error) {
@@ -104,22 +106,24 @@ func (t *TestMetastore) Sections(_ context.Context, _ time.Time, _ time.Time, _ 
 				ObjectPath: "objects/00/0000000000.dataobj",
 				SectionIdx: 0,
 			},
-			StreamIDs: []int64{1, 3, 5, 7, 9},
-			RowCount:  1000,
-			Size:      1 << 10,
-			Start:     time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC),
-			End:       time.Date(2025, time.January, 1, 0, 30, 0, 0, time.UTC),
+			StreamIDs:       []int64{1, 3, 5, 7, 9},
+			RowCount:        1000,
+			Size:            1 << 10,
+			Start:           time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC),
+			End:             time.Date(2025, time.January, 1, 0, 30, 0, 0, time.UTC),
+			MetadataColumns: t.MetadataColumns,
 		},
 		{
 			SectionKey: metastore.SectionKey{
 				ObjectPath: "objects/00/0000000000.dataobj",
 				SectionIdx: 1,
 			},
-			StreamIDs: []int64{1, 3, 5, 7, 9},
-			RowCount:  1000,
-			Size:      1 << 10,
-			Start:     time.Date(2025, time.January, 1, 0, 30, 0, 0, time.UTC),
-			End:       time.Date(2025, time.January, 1, 1, 0, 0, 0, time.UTC),
+			StreamIDs:       []int64{1, 3, 5, 7, 9},
+			RowCount:        1000,
+			Size:            1 << 10,
+			Start:           time.Date(2025, time.January, 1, 0, 30, 0, 0, time.UTC),
+			End:             time.Date(2025, time.January, 1, 1, 0, 0, 0, time.UTC),
+			MetadataColumns: t.MetadataColumns,
 		},
 	}, nil
 }
@@ -127,7 +131,9 @@ func (t *TestMetastore) Sections(_ context.Context, _ time.Time, _ time.Time, _ 
 var _ metastore.Metastore = (*TestMetastore)(nil)
 
 func TestFullQueryPlanning(t *testing.T) {
-	ms := &TestMetastore{}
+	metastore := &TestMetastore{
+		MetadataColumns: []string{"detected_level"},
+	}
 	testCases := []struct {
 		comment  string
 		query    string
@@ -227,7 +233,7 @@ VectorAggregation operation=sum
                         └── Projection all=true expand=(PARSE_LOGFMT(builtin.message, [], false, false))
                             └── Filter predicate[0]=EQ(ambiguous.detected_level, "error")
                                 └── Compat src=metadata dst=metadata collisions=(label)
-                                    └── ScanSet num_targets=2 projections=(ambiguous.detected_level, builtin.message, builtin.timestamp) predicate[0]=GTE(builtin.timestamp, 2024-12-31T23:59:00Z) predicate[1]=LT(builtin.timestamp, 2025-01-01T01:00:00Z)
+                                    └── ScanSet num_targets=2 projections=(ambiguous.detected_level, builtin.message, builtin.timestamp) predicate[0]=EQ(metadata.detected_level, "error") predicate[1]=GTE(builtin.timestamp, 2024-12-31T23:59:00Z) predicate[2]=LT(builtin.timestamp, 2025-01-01T01:00:00Z)
                                             ├── @target type=ScanTypeDataObject location=objects/00/0000000000.dataobj streams=5 section_id=1 projections=()
                                             └── @target type=ScanTypeDataObject location=objects/00/0000000000.dataobj streams=5 section_id=0 projections=()
 
@@ -296,9 +302,7 @@ VectorAggregation operation=sum group_by=(ambiguous.bar)
 			logicalPlan, err := logical.BuildPlan(q)
 			require.NoError(t, err)
 
-			catalog := physical.NewMetastoreCatalog(func(start time.Time, end time.Time, selectors []*labels.Matcher, predicates []*labels.Matcher) ([]*metastore.DataobjSectionDescriptor, error) {
-				return ms.Sections(ctx, start, end, selectors, predicates)
-			})
+			catalog := physical.NewMetastoreCatalog(ctx, metastore)
 			planner := physical.NewPlanner(physical.NewContext(q.Start(), q.End()), catalog)
 
 			plan, err := planner.Build(logicalPlan)

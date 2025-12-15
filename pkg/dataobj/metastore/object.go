@@ -54,24 +54,30 @@ type SectionKey struct {
 type DataobjSectionDescriptor struct {
 	SectionKey
 
-	StreamIDs []int64
-	RowCount  int
-	Size      int64
-	Start     time.Time
-	End       time.Time
+	StreamIDs       []int64
+	RowCount        int
+	Size            int64
+	Start           time.Time
+	End             time.Time
+	MetadataColumns []string
 }
 
 func NewSectionDescriptor(pointer pointers.SectionPointer) *DataobjSectionDescriptor {
+	return NewSectionDescriptorWithMetadata(pointer, nil)
+}
+
+func NewSectionDescriptorWithMetadata(pointer pointers.SectionPointer, metadataColumns []string) *DataobjSectionDescriptor {
 	return &DataobjSectionDescriptor{
 		SectionKey: SectionKey{
 			ObjectPath: pointer.Path,
 			SectionIdx: pointer.Section,
 		},
-		StreamIDs: []int64{pointer.StreamIDRef},
-		RowCount:  int(pointer.LineCount),
-		Size:      pointer.UncompressedSize,
-		Start:     pointer.StartTs,
-		End:       pointer.EndTs,
+		StreamIDs:       []int64{pointer.StreamIDRef},
+		RowCount:        int(pointer.LineCount),
+		Size:            pointer.UncompressedSize,
+		Start:           pointer.StartTs,
+		End:             pointer.EndTs,
+		MetadataColumns: metadataColumns,
 	}
 }
 
@@ -533,13 +539,13 @@ func (m *ObjectMetastore) getSectionsForStreams(ctx context.Context, indexObject
 			objectSectionDescriptors := make(map[SectionKey]*DataobjSectionDescriptor)
 			sectionPointerReadTimer := prometheus.NewTimer(m.metrics.streamFilterPointersReadDuration)
 
-			err = forEachStreamSectionPointer(ctx, indexObject, sStart, sEnd, matchingStreamIDs, func(pointer pointers.SectionPointer) {
+			err = forEachStreamSectionPointer(ctx, indexObject, sStart, sEnd, matchingStreamIDs, func(pointer pointers.SectionPointer, metadataColumns []string) {
 				key.ObjectPath = pointer.Path
 				key.SectionIdx = pointer.Section
 
 				sectionDescriptor, ok := objectSectionDescriptors[key]
 				if !ok {
-					objectSectionDescriptors[key] = NewSectionDescriptor(pointer)
+					objectSectionDescriptors[key] = NewSectionDescriptorWithMetadata(pointer, metadataColumns)
 					return
 				}
 				sectionDescriptor.Merge(pointer)

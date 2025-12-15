@@ -737,6 +737,442 @@ func TestPlanner_BuildMathExpressionsWithTwoInputs(t *testing.T) {
 	t.Logf("Optimized plan\n%s\n", PrintAsTree(physicalPlan))
 }
 
+func TestDisambiguateExpression(t *testing.T) {
+	metadataCols := map[string]struct{}{
+		"trace_id":   {},
+		"request_id": {},
+	}
+
+	t.Run("resolves ambiguous column to metadata when in set", func(t *testing.T) {
+		expr := &ColumnExpr{
+			Ref: types.ColumnRef{
+				Column: "trace_id",
+				Type:   types.ColumnTypeAmbiguous,
+			},
+		}
+		result, changed := disambiguateExpression(expr, metadataCols)
+		require.True(t, changed)
+		colExpr, ok := result.(*ColumnExpr)
+		require.True(t, ok)
+		require.Equal(t, "trace_id", colExpr.Ref.Column)
+		require.Equal(t, types.ColumnTypeMetadata, colExpr.Ref.Type)
+	})
+
+	t.Run("leaves ambiguous column unchanged when not in set", func(t *testing.T) {
+		expr := &ColumnExpr{
+			Ref: types.ColumnRef{
+				Column: "unknown_col",
+				Type:   types.ColumnTypeAmbiguous,
+			},
+		}
+		result, changed := disambiguateExpression(expr, metadataCols)
+		require.False(t, changed)
+		colExpr, ok := result.(*ColumnExpr)
+		require.True(t, ok)
+		require.Equal(t, "unknown_col", colExpr.Ref.Column)
+		require.Equal(t, types.ColumnTypeAmbiguous, colExpr.Ref.Type)
+	})
+
+	t.Run("leaves non-ambiguous columns unchanged", func(t *testing.T) {
+		expr := &ColumnExpr{
+			Ref: types.ColumnRef{
+				Column: "app",
+				Type:   types.ColumnTypeLabel,
+			},
+		}
+		result, changed := disambiguateExpression(expr, metadataCols)
+		require.False(t, changed)
+		colExpr, ok := result.(*ColumnExpr)
+		require.True(t, ok)
+		require.Equal(t, "app", colExpr.Ref.Column)
+		require.Equal(t, types.ColumnTypeLabel, colExpr.Ref.Type)
+	})
+
+	t.Run("recursively resolves binary expressions", func(t *testing.T) {
+		expr := &BinaryExpr{
+			Left: &ColumnExpr{
+				Ref: types.ColumnRef{Column: "trace_id", Type: types.ColumnTypeAmbiguous},
+			},
+			Right: NewLiteral("abc123"),
+			Op:    types.BinaryOpEq,
+		}
+		result, changed := disambiguateExpression(expr, metadataCols)
+		require.True(t, changed)
+		binExpr, ok := result.(*BinaryExpr)
+		require.True(t, ok)
+
+		leftCol, ok := binExpr.Left.(*ColumnExpr)
+		require.True(t, ok)
+		require.Equal(t, types.ColumnTypeMetadata, leftCol.Ref.Type)
+	})
+
+	t.Run("handles nil expression", func(t *testing.T) {
+		result, changed := disambiguateExpression(nil, metadataCols)
+		require.False(t, changed)
+		require.Nil(t, result)
+	})
+
+	t.Run("handles nested AND expressions", func(t *testing.T) {
+		expr := &BinaryExpr{
+			Left: &BinaryExpr{
+				Left:  &ColumnExpr{Ref: types.ColumnRef{Column: "trace_id", Type: types.ColumnTypeAmbiguous}},
+				Right: NewLiteral("abc"),
+				Op:    types.BinaryOpEq,
+			},
+			Right: &BinaryExpr{
+				Left:  &ColumnExpr{Ref: types.ColumnRef{Column: "request_id", Type: types.ColumnTypeAmbiguous}},
+				Right: NewLiteral("123"),
+				Op:    types.BinaryOpEq,
+			},
+			Op: types.BinaryOpAnd,
+		}
+		result, changed := disambiguateExpression(expr, metadataCols)
+		require.True(t, changed)
+		binExpr, ok := result.(*BinaryExpr)
+		require.True(t, ok)
+
+		leftBin, ok := binExpr.Left.(*BinaryExpr)
+		require.True(t, ok)
+		leftCol, ok := leftBin.Left.(*ColumnExpr)
+		require.True(t, ok)
+		require.Equal(t, types.ColumnTypeMetadata, leftCol.Ref.Type)
+
+		rightBin, ok := binExpr.Right.(*BinaryExpr)
+		require.True(t, ok)
+		rightCol, ok := rightBin.Left.(*ColumnExpr)
+		require.True(t, ok)
+		require.Equal(t, types.ColumnTypeMetadata, rightCol.Ref.Type)
+	})
+}
+
+func TestPlanner_MetadataColumnResolution(t *testing.T) {
+	timeStart := time.Now()
+	timeEnd := timeStart.Add(time.Second * 10)
+
+	findScanSetPredicates := func(plan *Plan) []Expression {
+		var predicates []Expression
+		for node := range plan.graph.Nodes() {
+			if scanSet, ok := node.(*ScanSet); ok {
+				predicates = append(predicates, scanSet.Predicates...)
+			}
+		}
+		return predicates
+	}
+
+	findFilterPredicates := func(plan *Plan) []Expression {
+		var predicates []Expression
+		for node := range plan.graph.Nodes() {
+			if filter, ok := node.(*Filter); ok {
+				predicates = append(predicates, filter.Predicates...)
+			}
+		}
+		return predicates
+	}
+
+	var hasColumnType func(expr Expression, colName string, colType types.ColumnType) bool
+	hasColumnType = func(expr Expression, colName string, colType types.ColumnType) bool {
+		switch e := expr.(type) {
+		case *BinaryExpr:
+			return hasColumnType(e.Left, colName, colType) || hasColumnType(e.Right, colName, colType)
+		case *ColumnExpr:
+			return e.Ref.Column == colName && e.Ref.Type == colType
+		}
+		return false
+	}
+
+	t.Run("resolves ambiguous column type to metadata in predicates", func(t *testing.T) {
+		cat := &catalog{
+			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
+				{
+					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:       []int64{1, 2},
+					Start:           timeStart,
+					End:             timeEnd,
+					MetadataColumns: []string{"trace_id", "span_id"},
+				},
+			},
+		}
+
+		// Build a query: {app="users"} | trace_id="abc123"
+		// The trace_id filter is ambiguous but should be resolved to metadata when present
+		b := logical.NewBuilder(
+			&logical.MakeTable{
+				Selector: &logical.BinOp{
+					Left:  logical.NewColumnRef("app", types.ColumnTypeLabel),
+					Right: logical.NewLiteral("users"),
+					Op:    types.BinaryOpEq,
+				},
+				Predicates: []logical.Value{
+					&logical.BinOp{
+						Left:  logical.NewColumnRef("trace_id", types.ColumnTypeAmbiguous),
+						Right: logical.NewLiteral("abc123"),
+						Op:    types.BinaryOpEq,
+					},
+				},
+				Shard: logical.NewShard(0, 1),
+			},
+		).Select(
+			&logical.BinOp{
+				Left:  logical.NewColumnRef("trace_id", types.ColumnTypeAmbiguous),
+				Right: logical.NewLiteral("abc123"),
+				Op:    types.BinaryOpEq,
+			},
+		)
+
+		logicalPlan, err := b.ToPlan()
+		require.NoError(t, err)
+
+		planner := NewPlanner(NewContext(timeStart, timeEnd), cat)
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		// After optimization, the metadata predicate should be pushed down to DataObjScan
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
+		scanPredicates := findScanSetPredicates(optimizedPlan)
+		require.NotEmpty(t, scanPredicates, "predicate should be pushed to ScanSet after resolution to metadata")
+
+		// Verify the pushed predicate has the column resolved to metadata type
+		found := false
+		for _, pred := range scanPredicates {
+			if hasColumnType(pred, "trace_id", types.ColumnTypeMetadata) {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "trace_id should be resolved to ColumnTypeMetadata in pushed predicate")
+	})
+
+	t.Run("predicates for ambiguous columns not in metadata are not changed", func(t *testing.T) {
+		cat := &catalog{
+			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
+				{
+					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:       []int64{1, 2},
+					Start:           timeStart,
+					End:             timeEnd,
+					MetadataColumns: []string{"trace_id"}, // Does NOT contain "unknown_col"
+				},
+			},
+		}
+
+		// Build a query with an ambiguous column that's NOT in metadata
+		b := logical.NewBuilder(
+			&logical.MakeTable{
+				Selector: &logical.BinOp{
+					Left:  logical.NewColumnRef("app", types.ColumnTypeLabel),
+					Right: logical.NewLiteral("users"),
+					Op:    types.BinaryOpEq,
+				},
+				Predicates: []logical.Value{
+					&logical.BinOp{
+						Left:  logical.NewColumnRef("unknown_col", types.ColumnTypeAmbiguous),
+						Right: logical.NewLiteral("value"),
+						Op:    types.BinaryOpEq,
+					},
+				},
+				Shard: logical.NewShard(0, 1),
+			},
+		).Select(
+			&logical.BinOp{
+				Left:  logical.NewColumnRef("unknown_col", types.ColumnTypeAmbiguous),
+				Right: logical.NewLiteral("value"),
+				Op:    types.BinaryOpEq,
+			},
+		)
+
+		logicalPlan, err := b.ToPlan()
+		require.NoError(t, err)
+
+		planner := NewPlanner(NewContext(timeStart, timeEnd), cat)
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
+		// The ambiguous predicate should NOT be pushed down because it wasn't resolved to metadata
+		filterPredicates := findFilterPredicates(optimizedPlan)
+		require.NotEmpty(t, filterPredicates, "ambiguous predicate not in metadata should stay in Filter")
+
+		// Verify it's still ambiguous type
+		found := false
+		for _, pred := range filterPredicates {
+			if hasColumnType(pred, "unknown_col", types.ColumnTypeAmbiguous) {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "unknown_col should remain ColumnTypeAmbiguous")
+	})
+
+	t.Run("unions metadata columns from multiple sections for resolution", func(t *testing.T) {
+		cat := &catalog{
+			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
+				{
+					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:       []int64{1, 2},
+					Start:           timeStart,
+					End:             timeEnd,
+					MetadataColumns: []string{"trace_id"}, // Only trace_id
+				},
+				{
+					SectionKey:      metastore.SectionKey{ObjectPath: "obj2", SectionIdx: 0},
+					StreamIDs:       []int64{3, 4},
+					Start:           timeStart,
+					End:             timeEnd,
+					MetadataColumns: []string{"span_id"}, // Only span_id
+				},
+			},
+		}
+
+		// Both trace_id and span_id should be resolvable because we union from all shards
+		b := logical.NewBuilder(
+			&logical.MakeTable{
+				Selector: &logical.BinOp{
+					Left:  logical.NewColumnRef("app", types.ColumnTypeLabel),
+					Right: logical.NewLiteral("users"),
+					Op:    types.BinaryOpEq,
+				},
+				Predicates: []logical.Value{
+					&logical.BinOp{
+						Left:  logical.NewColumnRef("trace_id", types.ColumnTypeAmbiguous),
+						Right: logical.NewLiteral("abc"),
+						Op:    types.BinaryOpEq,
+					},
+					&logical.BinOp{
+						Left:  logical.NewColumnRef("span_id", types.ColumnTypeAmbiguous),
+						Right: logical.NewLiteral("abc"),
+						Op:    types.BinaryOpEq,
+					},
+					&logical.BinOp{
+						Left:  logical.NewColumnRef("unknown_col", types.ColumnTypeAmbiguous),
+						Right: logical.NewLiteral("abc"),
+						Op:    types.BinaryOpEq,
+					},
+				},
+				Shard: logical.NewShard(0, 1),
+			},
+		).Select(
+			&logical.BinOp{
+				Left:  logical.NewColumnRef("trace_id", types.ColumnTypeAmbiguous),
+				Right: logical.NewLiteral("abc"),
+				Op:    types.BinaryOpEq,
+			},
+		).Select(
+			&logical.BinOp{
+				Left:  logical.NewColumnRef("span_id", types.ColumnTypeAmbiguous),
+				Right: logical.NewLiteral("abc"),
+				Op:    types.BinaryOpEq,
+			},
+		).Select(
+			&logical.BinOp{
+				Left:  logical.NewColumnRef("unknown_col", types.ColumnTypeAmbiguous),
+				Right: logical.NewLiteral("abc"),
+				Op:    types.BinaryOpEq,
+			},
+		)
+
+		logicalPlan, err := b.ToPlan()
+		require.NoError(t, err)
+
+		planner := NewPlanner(NewContext(timeStart, timeEnd), cat)
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
+		// trace_id and span_id should be pushed down (resolved to metadata)
+		scanPredicates := findScanSetPredicates(optimizedPlan)
+		require.NotEmpty(t, scanPredicates, "metadata predicates should be pushed down")
+
+		var traceIdFound, spanIdFound bool
+		for _, pred := range scanPredicates {
+			if hasColumnType(pred, "trace_id", types.ColumnTypeMetadata) {
+				traceIdFound = true
+			}
+			if hasColumnType(pred, "span_id", types.ColumnTypeMetadata) {
+				spanIdFound = true
+			}
+		}
+		require.True(t, traceIdFound, "trace_id should be resolved to ColumnTypeMetadata")
+		require.True(t, spanIdFound, "span_id should be resolved to ColumnTypeMetadata")
+
+		// unknown_col should stay in Filter (not pushed down)
+		filterPredicates := findFilterPredicates(optimizedPlan)
+		var unknownColFound bool
+		for _, pred := range filterPredicates {
+			if hasColumnType(pred, "unknown_col", types.ColumnTypeAmbiguous) {
+				unknownColFound = true
+			}
+		}
+		require.True(t, unknownColFound, "unknown_col should remain in Filter as ColumnTypeAmbiguous")
+	})
+
+	t.Run("handles empty metadata columns gracefully", func(t *testing.T) {
+		cat := &catalog{
+			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
+				{
+					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:       []int64{1, 2},
+					Start:           timeStart,
+					End:             timeEnd,
+					MetadataColumns: nil, // No metadata columns
+				},
+			},
+		}
+
+		b := logical.NewBuilder(
+			&logical.MakeTable{
+				Selector: &logical.BinOp{
+					Left:  logical.NewColumnRef("app", types.ColumnTypeLabel),
+					Right: logical.NewLiteral("users"),
+					Op:    types.BinaryOpEq,
+				},
+				Predicates: []logical.Value{
+					&logical.BinOp{
+						Left:  logical.NewColumnRef("trace_id", types.ColumnTypeAmbiguous),
+						Right: logical.NewLiteral("abc"),
+						Op:    types.BinaryOpEq,
+					},
+				},
+				Shard: logical.NewShard(0, 1),
+			},
+		).Select(
+			&logical.BinOp{
+				Left:  logical.NewColumnRef("trace_id", types.ColumnTypeAmbiguous),
+				Right: logical.NewLiteral("abc"),
+				Op:    types.BinaryOpEq,
+			},
+		)
+
+		logicalPlan, err := b.ToPlan()
+		require.NoError(t, err)
+
+		planner := NewPlanner(NewContext(timeStart, timeEnd), cat)
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
+		// With no metadata columns, nothing should be resolved and predicate stays in Filter
+		filterPredicates := findFilterPredicates(optimizedPlan)
+		require.NotEmpty(t, filterPredicates, "predicate should stay in Filter when no metadata columns")
+
+		found := false
+		for _, pred := range filterPredicates {
+			if hasColumnType(pred, "trace_id", types.ColumnTypeAmbiguous) {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "trace_id should remain ColumnTypeAmbiguous when not in metadata")
+	})
+}
+
 func TestPlanner_MakeTable_Ordering(t *testing.T) {
 	// Two separate groups with different timestamps in each group
 	now := time.Now()

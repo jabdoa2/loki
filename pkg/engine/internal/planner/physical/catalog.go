@@ -67,10 +67,11 @@ func (t *TimeRange) Merge(secondRange TimeRange) TimeRange {
 }
 
 type DataObjSections struct {
-	Location  DataObjLocation
-	Streams   []int64
-	Sections  []int
-	TimeRange TimeRange
+	Location        DataObjLocation
+	Streams         []int64
+	Sections        []int
+	TimeRange       TimeRange
+	MetadataColumns []string // metadata column names found in this shard (from column index pointers)
 }
 
 // Catalog is an interface that provides methods for interacting with
