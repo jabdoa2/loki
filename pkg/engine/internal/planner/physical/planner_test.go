@@ -1088,17 +1088,17 @@ func TestPlanner_MetadataColumnResolution(t *testing.T) {
 		scanPredicates := findScanSetPredicates(optimizedPlan)
 		require.NotEmpty(t, scanPredicates, "metadata predicates should be pushed down")
 
-		var traceIdFound, spanIdFound bool
+		var traceIDFound, spanIDFound bool
 		for _, pred := range scanPredicates {
 			if hasColumnType(pred, "trace_id", types.ColumnTypeMetadata) {
-				traceIdFound = true
+				traceIDFound = true
 			}
 			if hasColumnType(pred, "span_id", types.ColumnTypeMetadata) {
-				spanIdFound = true
+				spanIDFound = true
 			}
 		}
-		require.True(t, traceIdFound, "trace_id should be resolved to ColumnTypeMetadata")
-		require.True(t, spanIdFound, "span_id should be resolved to ColumnTypeMetadata")
+		require.True(t, traceIDFound, "trace_id should be resolved to ColumnTypeMetadata")
+		require.True(t, spanIDFound, "span_id should be resolved to ColumnTypeMetadata")
 
 		// unknown_col should stay in Filter (not pushed down)
 		filterPredicates := findFilterPredicates(optimizedPlan)
