@@ -200,11 +200,6 @@ func (p *Planner) processMakeTable(lp *logical.MakeTable, ctx *Context) (Node, e
 		slices.Reverse(dataObjs)
 	}
 
-	labels, err := p.catalog.ResolveLabels(p.convertPredicate(lp.Selector), from, through)
-	if err != nil {
-		return nil, err
-	}
-
 	// Scan work can be parallelized across multiple workers, so we wrap
 	// everything into a single Parallelize node.
 	var parallelize Node = &Parallelize{
