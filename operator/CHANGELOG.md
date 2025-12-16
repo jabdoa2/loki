@@ -1,5 +1,12 @@
 ## Main
 
+## [0.9.1](https://github.com/grafana/loki/compare/operator/v0.9.0...operator/v0.9.1) (2025-12-16)
+
+
+### Features
+
+* **operator:** add option to disable ingress ([#19382](https://github.com/grafana/loki/issues/19382)) ([9dc71a6](https://github.com/grafana/loki/commit/9dc71a642569b64b6c21b23f23671b0f18f6285d))
+
 ## [0.9.0](https://github.com/grafana/loki/compare/operator/v0.8.0...operator/v0.9.0) (2025-12-04)
 
 
