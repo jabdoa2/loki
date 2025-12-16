@@ -200,6 +200,11 @@ func (p *Planner) processMakeTable(lp *logical.MakeTable, ctx *Context) (Node, e
 		slices.Reverse(dataObjs)
 	}
 
+	labels, err := p.catalog.ResolveLabels(p.convertPredicate(lp.Selector), from, through)
+	if err != nil {
+		return nil, err
+	}
+
 	// Scan work can be parallelized across multiple workers, so we wrap
 	// everything into a single Parallelize node.
 	var parallelize Node = &Parallelize{
@@ -207,17 +212,27 @@ func (p *Planner) processMakeTable(lp *logical.MakeTable, ctx *Context) (Node, e
 	}
 	p.plan.graph.Add(parallelize)
 
+	// resolve ambiguous predicates to metadata/label where applicable to improve scanning
+	unambiguousPredicates := make([]Expression, 0, len(predicates))
+	labels, err := p.catalog.ResolveLabels(p.convertPredicate(lp.Selector), from, through)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, predicate := range predicates {
+		p, changed := disambiguateExpression(predicate, labels)
+		if changed {
+			unambiguousPredicates = append(unambiguousPredicates, p)
+		}
+	}
+
 	scanSet := &ScanSet{
-		NodeID: ulid.Make(),
+		NodeID:     ulid.Make(),
+		Predicates: unambiguousPredicates,
 	}
 	p.plan.graph.Add(scanSet)
 
-	metadataColumns := make(map[string]struct{})
 	for _, dataObj := range dataObjs {
-		for _, col := range dataObj.MetadataColumns {
-			metadataColumns[col] = struct{}{}
-		}
-
 		for _, section := range dataObj.Sections {
 			scanSet.Targets = append(scanSet.Targets, &ScanTarget{
 				Type: ScanTypeDataObject,
@@ -233,16 +248,6 @@ func (p *Planner) processMakeTable(lp *logical.MakeTable, ctx *Context) (Node, e
 			})
 		}
 	}
-
-	// resolve ambiguous predicates to metadata type where applicable to improve scanning
-	unambiguousPredicates := make([]Expression, 0, len(predicates))
-	for _, predicate := range predicates {
-		p, changed := disambiguateExpression(predicate, metadataColumns)
-		if changed {
-			unambiguousPredicates = append(unambiguousPredicates, p)
-		}
-	}
-	scanSet.Predicates = unambiguousPredicates
 
 	var base Node = scanSet
 
@@ -656,16 +661,16 @@ func (p *Planner) wrapNodeWith(node Node, wrapper Node) (Node, error) {
 }
 
 // disambiguateExpression recursively updates ColumnTypeAmbiguous references
-// to ColumnTypeMetadata if the column name exists in the provided metadata columns set.
-func disambiguateExpression(expr Expression, metadataCols map[string]struct{}) (Expression, bool) {
+// to ColumnTypeMetadata if the column name does not exist in the provided label set
+func disambiguateExpression(expr Expression, labels []string) (Expression, bool) {
 	if expr == nil {
 		return nil, false
 	}
 
 	switch e := expr.(type) {
 	case *BinaryExpr:
-		leftExpr, leftChanged := disambiguateExpression(e.Left, metadataCols)
-		rightExpr, rightChanged := disambiguateExpression(e.Right, metadataCols)
+		leftExpr, leftChanged := disambiguateExpression(e.Left, labels)
+		rightExpr, rightChanged := disambiguateExpression(e.Right, labels)
 		return &BinaryExpr{
 			Left:  leftExpr,
 			Right: rightExpr,
@@ -673,18 +678,25 @@ func disambiguateExpression(expr Expression, metadataCols map[string]struct{}) (
 		}, leftChanged || rightChanged
 	case *ColumnExpr:
 		if e.Ref.Type == types.ColumnTypeAmbiguous {
-			if _, isMetadata := metadataCols[e.Ref.Column]; isMetadata {
+			if slices.Contains(labels, e.Ref.Column) {
 				return &ColumnExpr{
 					Ref: types.ColumnRef{
 						Column: e.Ref.Column,
-						Type:   types.ColumnTypeMetadata,
+						Type:   types.ColumnTypeLabel,
 					},
 				}, true
 			}
+
+			return &ColumnExpr{
+				Ref: types.ColumnRef{
+					Column: e.Ref.Column,
+					Type:   types.ColumnTypeMetadata,
+				},
+			}, true
 		}
 		return e, false
 	case *UnaryExpr:
-		leftExpr, leftChanged := disambiguateExpression(e.Left, metadataCols)
+		leftExpr, leftChanged := disambiguateExpression(e.Left, labels)
 		return &UnaryExpr{
 			Left: leftExpr,
 			Op:   e.Op,
@@ -693,7 +705,7 @@ func disambiguateExpression(expr Expression, metadataCols map[string]struct{}) (
 		anyChanged := false
 		newExprs := make([]Expression, len(e.Expressions))
 		for i, subExpr := range e.Expressions {
-			exp, changed := disambiguateExpression(subExpr, metadataCols)
+			exp, changed := disambiguateExpression(subExpr, labels)
 			newExprs[i] = exp
 			anyChanged = anyChanged || changed
 		}

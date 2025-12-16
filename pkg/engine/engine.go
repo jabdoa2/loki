@@ -306,7 +306,7 @@ func (e *Engine) buildPhysicalPlan(ctx context.Context, logger log.Logger, param
 	region := xcap.RegionFromContext(ctx)
 	timer := prometheus.NewTimer(e.metrics.physicalPlanning)
 
-	catalog := physical.NewMetastoreCatalog(e.queryMetastoreSectionsFunc(ctx))
+	catalog := physical.NewMetastoreCatalog(e.queryMetastoreSectionsFunc(ctx), e.queryMetastoreLabelsFunc(ctx))
 
 	// TODO(rfratto): It feels strange that we need to past the start/end time
 	// to the physical planner. Isn't it already represented by the logical
@@ -335,6 +335,12 @@ func (e *Engine) buildPhysicalPlan(ctx context.Context, logger log.Logger, param
 
 	region.AddEvent("finished physical planning", attribute.Stringer("duration", duration))
 	return physicalPlan, duration, nil
+}
+
+func (e *Engine) queryMetastoreLabelsFunc(ctx context.Context) physical.MetastoreLabelsResolver {
+	return func(start time.Time, end time.Time, selector []*labels.Matcher) ([]string, error) {
+		return e.metastore.Labels(ctx, start, end, selector...)
+	}
 }
 
 func (e *Engine) queryMetastoreSectionsFunc(ctx context.Context) physical.MetastoreSectionsResolver {

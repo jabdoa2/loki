@@ -157,6 +157,8 @@ func (e *Basic) Execute(ctx context.Context, params logql.Params) (logqlmodel.Re
 
 		catalog := physical.NewMetastoreCatalog(func(start time.Time, end time.Time, selectors []*labels.Matcher, predicates []*labels.Matcher) ([]*metastore.DataobjSectionDescriptor, error) {
 			return e.metastore.Sections(ctx, start, end, selectors, predicates)
+		}, func(start time.Time, end time.Time, selectors []*labels.Matcher) ([]string, error) {
+			return e.metastore.Labels(ctx, start, end, selectors...)
 		})
 		planner := physical.NewPlanner(physical.NewContext(params.Start(), params.End()), catalog)
 		plan, err := planner.Build(logicalPlan)

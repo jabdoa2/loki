@@ -28,7 +28,7 @@ func forEachStreamSectionPointer(
 	indexObj *dataobj.Object,
 	sStart, sEnd *scalar.Timestamp,
 	streamIDs []int64,
-	f func(pointers.SectionPointer, []string),
+	f func(pointers.SectionPointer),
 ) error {
 	targetTenant, err := user.ExtractOrgID(ctx)
 	if err != nil {
@@ -45,7 +45,6 @@ func forEachStreamSectionPointer(
 
 	const batchSize = 128
 	buf := make([]pointers.SectionPointer, batchSize)
-	columnSet := make(map[string]struct{})
 
 	// iterate over the sections and fill buf column by column
 	// once the read operation is over invoke client's [f] on every read row (numRows not always the same as len(buf))
@@ -190,25 +189,13 @@ func forEachStreamSectionPointer(
 						}
 						buf[rIdx].UncompressedSize = values.Value(rIdx)
 					}
-				case pointers.ColumnTypeColumnName:
-					values := col.(*array.String)
-					for rIdx := range numRows {
-						if col.IsNull(rIdx) {
-							continue
-						}
-						columnSet[values.Value(rIdx)] = struct{}{}
-					}
 				default:
 					continue
 				}
 			}
 
-			columns := make([]string, 0, len(columnSet))
-			for col := range columnSet {
-				columns = append(columns, col)
-			}
 			for rowIdx := range numRows {
-				f(buf[rowIdx], columns)
+				f(buf[rowIdx])
 			}
 
 			if errors.Is(readErr, io.EOF) {

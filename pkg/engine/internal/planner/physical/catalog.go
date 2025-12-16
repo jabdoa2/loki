@@ -85,19 +85,23 @@ type Catalog interface {
 	// each data object path, a list of sections for
 	// each data object path, and a time range.
 	ResolveDataObjSections(Expression, []Expression, ShardInfo, time.Time, time.Time) ([]DataObjSections, error)
+	ResolveLabels(Expression, time.Time, time.Time) ([]string, error)
 }
 
 type MetastoreSectionsResolver func(time.Time, time.Time, []*labels.Matcher, []*labels.Matcher) ([]*metastore.DataobjSectionDescriptor, error)
+type MetastoreLabelsResolver func(time.Time, time.Time, []*labels.Matcher) ([]string, error)
 
 // MetastoreCatalog is the default implementation of [Catalog].
 type MetastoreCatalog struct {
 	sectionsResolver MetastoreSectionsResolver
+	labelsResolver   MetastoreLabelsResolver
 }
 
 // NewMetastoreCatalog creates a new instance of [MetastoreCatalog] for query planning.
-func NewMetastoreCatalog(sectionsResolver MetastoreSectionsResolver) *MetastoreCatalog {
+func NewMetastoreCatalog(sectionsResolver MetastoreSectionsResolver, labelsResolver MetastoreLabelsResolver) *MetastoreCatalog {
 	return &MetastoreCatalog{
 		sectionsResolver: sectionsResolver,
+		labelsResolver:   labelsResolver,
 	}
 }
 
@@ -230,6 +234,20 @@ func convertBinaryOp(t types.BinaryOp) (labels.MatchType, error) {
 		return -1, fmt.Errorf("invalid binary operator for matcher: %v", t)
 	}
 	return ty, nil
+}
+
+func (c *MetastoreCatalog) ResolveLabels(selector Expression, from, through time.Time) ([]string, error) {
+	selectorMatchers, err := expressionToMatchers(selector, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert selector expression into selector matchers: %w", err)
+	}
+
+	msLabels, err := c.labelsResolver(from, through, selectorMatchers)
+	if err != nil {
+		return nil, fmt.Errorf("resolve metastore sections: %w", err)
+	}
+
+	return msLabels, nil
 }
 
 var _ Catalog = (*MetastoreCatalog)(nil)

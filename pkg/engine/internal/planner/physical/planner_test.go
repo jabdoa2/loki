@@ -15,11 +15,16 @@ import (
 
 type catalog struct {
 	sectionDescriptors []*metastore.DataobjSectionDescriptor
+	labels             []string
 }
 
 // ResolveShardDescriptors implements Catalog.
 func (c *catalog) ResolveDataObjSections(_ Expression, _ []Expression, shard ShardInfo, _, _ time.Time) ([]DataObjSections, error) {
 	return filterForShard(shard, c.sectionDescriptors)
+}
+
+func (c *catalog) ResolveLabels(_ Expression, _ time.Time, _ time.Time) ([]string, error) {
+	return c.labels, nil
 }
 
 var _ Catalog = (*catalog)(nil)
@@ -738,19 +743,16 @@ func TestPlanner_BuildMathExpressionsWithTwoInputs(t *testing.T) {
 }
 
 func TestDisambiguateExpression(t *testing.T) {
-	metadataCols := map[string]struct{}{
-		"trace_id":   {},
-		"request_id": {},
-	}
+	labels := []string{"app", "env"}
 
-	t.Run("resolves ambiguous column to metadata when in set", func(t *testing.T) {
+	t.Run("resolves ambiguous column to metadata when not in set", func(t *testing.T) {
 		expr := &ColumnExpr{
 			Ref: types.ColumnRef{
 				Column: "trace_id",
 				Type:   types.ColumnTypeAmbiguous,
 			},
 		}
-		result, changed := disambiguateExpression(expr, metadataCols)
+		result, changed := disambiguateExpression(expr, labels)
 		require.True(t, changed)
 		colExpr, ok := result.(*ColumnExpr)
 		require.True(t, ok)
@@ -758,19 +760,19 @@ func TestDisambiguateExpression(t *testing.T) {
 		require.Equal(t, types.ColumnTypeMetadata, colExpr.Ref.Type)
 	})
 
-	t.Run("leaves ambiguous column unchanged when not in set", func(t *testing.T) {
+	t.Run("resolves ambiguous column to label when not in set", func(t *testing.T) {
 		expr := &ColumnExpr{
 			Ref: types.ColumnRef{
-				Column: "unknown_col",
+				Column: "app",
 				Type:   types.ColumnTypeAmbiguous,
 			},
 		}
-		result, changed := disambiguateExpression(expr, metadataCols)
-		require.False(t, changed)
+		result, changed := disambiguateExpression(expr, labels)
+		require.True(t, changed)
 		colExpr, ok := result.(*ColumnExpr)
 		require.True(t, ok)
-		require.Equal(t, "unknown_col", colExpr.Ref.Column)
-		require.Equal(t, types.ColumnTypeAmbiguous, colExpr.Ref.Type)
+		require.Equal(t, "app", colExpr.Ref.Column)
+		require.Equal(t, types.ColumnTypeLabel, colExpr.Ref.Type)
 	})
 
 	t.Run("leaves non-ambiguous columns unchanged", func(t *testing.T) {
@@ -780,7 +782,7 @@ func TestDisambiguateExpression(t *testing.T) {
 				Type:   types.ColumnTypeLabel,
 			},
 		}
-		result, changed := disambiguateExpression(expr, metadataCols)
+		result, changed := disambiguateExpression(expr, labels)
 		require.False(t, changed)
 		colExpr, ok := result.(*ColumnExpr)
 		require.True(t, ok)
@@ -796,7 +798,7 @@ func TestDisambiguateExpression(t *testing.T) {
 			Right: NewLiteral("abc123"),
 			Op:    types.BinaryOpEq,
 		}
-		result, changed := disambiguateExpression(expr, metadataCols)
+		result, changed := disambiguateExpression(expr, labels)
 		require.True(t, changed)
 		binExpr, ok := result.(*BinaryExpr)
 		require.True(t, ok)
@@ -807,7 +809,7 @@ func TestDisambiguateExpression(t *testing.T) {
 	})
 
 	t.Run("handles nil expression", func(t *testing.T) {
-		result, changed := disambiguateExpression(nil, metadataCols)
+		result, changed := disambiguateExpression(nil, labels)
 		require.False(t, changed)
 		require.Nil(t, result)
 	})
@@ -826,7 +828,7 @@ func TestDisambiguateExpression(t *testing.T) {
 			},
 			Op: types.BinaryOpAnd,
 		}
-		result, changed := disambiguateExpression(expr, metadataCols)
+		result, changed := disambiguateExpression(expr, labels)
 		require.True(t, changed)
 		binExpr, ok := result.(*BinaryExpr)
 		require.True(t, ok)
@@ -884,11 +886,10 @@ func TestPlanner_MetadataColumnResolution(t *testing.T) {
 		cat := &catalog{
 			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
 				{
-					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
-					StreamIDs:       []int64{1, 2},
-					Start:           timeStart,
-					End:             timeEnd,
-					MetadataColumns: []string{"trace_id", "span_id"},
+					SectionKey: metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:  []int64{1, 2},
+					Start:      timeStart,
+					End:        timeEnd,
 				},
 			},
 		}
@@ -948,11 +949,10 @@ func TestPlanner_MetadataColumnResolution(t *testing.T) {
 		cat := &catalog{
 			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
 				{
-					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
-					StreamIDs:       []int64{1, 2},
-					Start:           timeStart,
-					End:             timeEnd,
-					MetadataColumns: []string{"trace_id"}, // Does NOT contain "unknown_col"
+					SectionKey: metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:  []int64{1, 2},
+					Start:      timeStart,
+					End:        timeEnd,
 				},
 			},
 		}
@@ -1011,18 +1011,16 @@ func TestPlanner_MetadataColumnResolution(t *testing.T) {
 		cat := &catalog{
 			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
 				{
-					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
-					StreamIDs:       []int64{1, 2},
-					Start:           timeStart,
-					End:             timeEnd,
-					MetadataColumns: []string{"trace_id"}, // Only trace_id
+					SectionKey: metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:  []int64{1, 2},
+					Start:      timeStart,
+					End:        timeEnd,
 				},
 				{
-					SectionKey:      metastore.SectionKey{ObjectPath: "obj2", SectionIdx: 0},
-					StreamIDs:       []int64{3, 4},
-					Start:           timeStart,
-					End:             timeEnd,
-					MetadataColumns: []string{"span_id"}, // Only span_id
+					SectionKey: metastore.SectionKey{ObjectPath: "obj2", SectionIdx: 0},
+					StreamIDs:  []int64{3, 4},
+					Start:      timeStart,
+					End:        timeEnd,
 				},
 			},
 		}
@@ -1115,11 +1113,10 @@ func TestPlanner_MetadataColumnResolution(t *testing.T) {
 		cat := &catalog{
 			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
 				{
-					SectionKey:      metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
-					StreamIDs:       []int64{1, 2},
-					Start:           timeStart,
-					End:             timeEnd,
-					MetadataColumns: nil, // No metadata columns
+					SectionKey: metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
+					StreamIDs:  []int64{1, 2},
+					Start:      timeStart,
+					End:        timeEnd,
 				},
 			},
 		}

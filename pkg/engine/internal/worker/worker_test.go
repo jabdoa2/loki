@@ -174,6 +174,8 @@ func buildWorkflow(ctx context.Context, t *testing.T, logger log.Logger, loc obj
 	)
 	catalog := physical.NewMetastoreCatalog(func(start time.Time, end time.Time, selectors []*labels.Matcher, predicates []*labels.Matcher) ([]*metastore.DataobjSectionDescriptor, error) {
 		return ms.Sections(ctx, start, end, selectors, predicates)
+	}, func(start time.Time, end time.Time, selectors []*labels.Matcher) ([]string, error) {
+		return ms.Labels(ctx, start, end, selectors...)
 	})
 	planner := physical.NewPlanner(physical.NewContext(params.Start(), params.End()), catalog)
 	plan, err := planner.Build(logicalPlan)
